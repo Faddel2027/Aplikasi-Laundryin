@@ -1,0 +1,139 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasRole(role) {
+      return isAuthenticated() && getUserData().role == role;
+    }
+
+    function isCustomer() {
+      return hasRole('customer');
+    }
+
+    function isCourier() {
+      return hasRole('courier');
+    }
+
+    function isCashier() {
+      return hasRole('cashier');
+    }
+
+    // 1. Users collection (C-01, C-14, PRD Section 2)
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      // New user documents created by the client must always have role 'customer'.
+      // Courier and Cashier roles can only be assigned manually by Admin in Firebase Console.
+      allow create: if isOwner(userId) && request.resource.data.role == 'customer';
+      allow update: if isOwner(userId) && request.resource.data.role == resource.data.role; // Role cannot be escalated by user
+      allow delete: if false; // Users cannot be deleted directly from client
+    }
+
+    // 2. Addresses collection (C-09, C-16)
+    match /addresses/{addressId} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isCashier());
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated() && resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid;
+      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+
+    // 3. Services master collection (C-02)
+    match /services/{serviceId} {
+      allow read: if true; // Publicly readable for all users and guests
+      allow write: if false; // Master price catalog is immutable from client apps
+    }
+
+    // 4. Orders collection (C-03 to C-06, C-10, K-01 to K-04, S-01 to S-06)
+    match /orders/{orderId} {
+      // Customer can read own orders; Courier can read assigned orders; Cashier can read all outlet orders
+      allow read: if isAuthenticated() && (
+        (isCustomer() && resource.data.customerId == request.auth.uid) ||
+        (isCourier() && resource.data.kurirId == request.auth.uid) ||
+        isCashier()
+      );
+
+      // Customer can create order for themselves with initial status
+      allow create: if isCustomer() &&
+        request.resource.data.customerId == request.auth.uid &&
+        request.resource.data.status == 'menungguKonfirmasi' &&
+        request.resource.data.total == null; // Price calculated/verified by system/cashier
+
+      // Updates strictly bounded by role
+      allow update: if isAuthenticated() && (
+        // Customer may cancel before being picked up (C-10)
+        (isCustomer() && resource.data.customerId == request.auth.uid &&
+          (resource.data.status in ['menungguKonfirmasi', 'kurirMenujuLokasi']) &&
+          request.resource.data.status == 'dibatalkan' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt', 'cancelReason'])) ||
+
+        // Courier can only update status of assigned tasks with required proofs (K-01 to K-04)
+        (isCourier() && resource.data.kurirId == request.auth.uid && (
+          // Jemput: kurirMenujuLokasi -> dijemput (requires photo)
+          (resource.data.status == 'kurirMenujuLokasi' && request.resource.data.status == 'dijemput' && request.resource.data.pickupPhotos.size() >= 1) ||
+          // Antar: siapDiantar -> dalamPengantaran
+          (resource.data.status == 'siapDiantar' && request.resource.data.status == 'dalamPengantaran') ||
+          // Selesai: dalamPengantaran -> selesai (requires delivery proof photo)
+          (resource.data.status == 'dalamPengantaran' && request.resource.data.status == 'selesai' && request.resource.data.deliveryPhotos.size() >= 1)
+        )) ||
+
+        // Cashier can input weight/items, advance wash/iron status, and assign courier (S-01 to S-06)
+        (isCashier() && (
+          // Assign courier
+          (request.resource.data.diff(resource.data).affectedKeys().hasAny(['kurirId', 'status'])) ||
+          // Weighing & price calculation
+          (resource.data.status in ['dijemput', 'ditimbang'] && request.resource.data.status in ['ditimbang', 'dicuci']) ||
+          // Processing status updates: dicuci -> disetrika -> siapDiantar
+          (resource.data.status == 'dicuci' && request.resource.data.status == 'disetrika') ||
+          (resource.data.status == 'disetrika' && request.resource.data.status == 'siapDiantar')
+        ))
+      );
+
+      allow delete: if false; // Orders cannot be deleted
+    }
+
+    // 5. Payments collection (C-05, S-06)
+    match /payments/{paymentId} {
+      allow read: if isAuthenticated() && (
+        resource.data.customerId == request.auth.uid || isCashier()
+      );
+      // Cashier can record cash payment, sandbox Cloud Functions handles digital payments
+      allow create: if isCashier() && request.resource.data.method == 'tunai';
+      allow update: if false; // Client cannot tamper with payment statuses directly
+      allow delete: if false;
+    }
+
+    // 6. Promos collection (C-12, C-18)
+    match /promos/{promoId} {
+      allow read: if isAuthenticated();
+      allow write: if false; // Admin managed
+    }
+
+    // 7. Reviews collection (C-11)
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create: if isCustomer() && request.resource.data.customerId == request.auth.uid;
+      allow update: if isCustomer() && resource.data.customerId == request.auth.uid;
+      allow delete: if false;
+    }
+
+    // 8. Notifications collection (C-07)
+    match /notifications/{notifId} {
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated() && resource.data.userId == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']);
+      allow write: if false; // Push generated by Cloud Functions
+    }
+  }
+}
